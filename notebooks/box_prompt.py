@@ -101,12 +101,7 @@ def _(boxes, detect_similar, image, instruction, mo, run):
     mo.stop(not run.value, mo.md("*Draw your boxes, then click **Run detection**.*"))
 
     with mo.status.spinner(title="Asking the model…"):
-        detections, raw_answer = detect_similar(
-            image,
-            boxes,
-            instruction.value,
-            enable_thinking=False,
-        )
+        detections, raw_answer = detect_similar(image, boxes, instruction.value)
     return detections, raw_answer
 
 

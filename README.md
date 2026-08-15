@@ -12,8 +12,17 @@ result can be compared against a real annotation.
 
 ```bash
 uv sync
-cp .env.example .env      # then paste your DASHSCOPE_API_KEY
 ```
+
+Then paste your OpenRouter key into `.env` (already created, gitignored):
+
+```
+OPENROUTER_API_KEY=sk-or-...
+```
+
+Model defaults to `qwen/qwen3.8-max`. Override with `OPENROUTER_MODEL` — e.g.
+`qwen/qwen3.8-2.4t-a95b` for the open-weight release, or any other vision model
+on OpenRouter, which is the point: swapping one env var gives you a comparison.
 
 ## Run
 
@@ -41,6 +50,7 @@ tests/                        parsing tests (no network)
   measurably beats coordinates alone.
 - `parse_detections` raises on unparseable output rather than returning `[]`, so
   a broken response is never silently read as "found nothing".
-- Model and endpoint are overridable via `QWEN_MODEL` and `QWEN_BASE_URL`.
+- `temperature=0.0` by default, so repeated runs are as comparable as the
+  provider allows.
 - Whatever prompt string you use is part of the method. Record it with the
   results — it defines what counts as the object.

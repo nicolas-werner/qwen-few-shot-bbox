@@ -1,8 +1,14 @@
-"""Few-shot box prompting against Qwen3.8-Max on the DashScope compatible endpoint.
+"""Few-shot box prompting against Qwen3.8-Max, served through OpenRouter.
 
 The trick borrowed from the Gradio reference app: the example boxes are *drawn
 onto* the image before sending, and additionally passed as normalized
 coordinates in the text prompt. The model sees the exemplars both ways.
+
+Any vision model on OpenRouter works — set ``OPENROUTER_MODEL`` or pass
+``model=``. Useful slugs:
+
+``qwen/qwen3.8-max``          proprietary hosted version (default)
+``qwen/qwen3.8-2.4t-a95b``    the open-weight MoE release
 """
 
 from __future__ import annotations
@@ -25,10 +31,8 @@ __all__ = [
     "parse_detections",
 ]
 
-DEFAULT_MODEL = "qwen3.8-max"
-DEFAULT_BASE_URL = (
-    "https://dashscope-intl.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1"
-)
+DEFAULT_MODEL = "qwen/qwen3.8-max"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 POSITIVE_COLOR = "#16a34a"
 NEGATIVE_COLOR = "#dc2626"
@@ -165,17 +169,28 @@ def parse_detections(
 def _client(timeout: float = 180.0):
     from openai import OpenAI
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+    api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "DASHSCOPE_API_KEY is not set. Copy .env.example to .env and fill it in."
+            "OPENROUTER_API_KEY is not set. Paste your key into .env "
+            "(copy .env.example if .env is missing), then restart the notebook."
         )
     return OpenAI(
         api_key=api_key,
-        base_url=os.getenv("QWEN_BASE_URL", DEFAULT_BASE_URL),
+        base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
         timeout=timeout,
         max_retries=2,
     )
+
+
+def _extra_headers() -> dict[str, str]:
+    """Optional OpenRouter attribution headers. Both are safe to leave unset."""
+    headers = {}
+    if referer := os.getenv("OPENROUTER_SITE_URL"):
+        headers["HTTP-Referer"] = referer
+    if title := os.getenv("OPENROUTER_SITE_NAME"):
+        headers["X-OpenRouter-Title"] = title
+    return headers
 
 
 PROMPT_TEMPLATE = """
@@ -203,8 +218,8 @@ def detect_similar(
     instruction: str = "",
     *,
     model: str | None = None,
-    enable_thinking: bool = False,
-    max_output_tokens: int = 8192,
+    max_tokens: int = 8192,
+    temperature: float = 0.0,
 ) -> tuple[list[Detection], str]:
     """Run one few-shot box prompt. Returns ``(detections, raw_answer)``.
 
@@ -223,24 +238,28 @@ def detect_similar(
     )
     annotated = annotate_prompt_boxes(image, boxes)
 
-    response = _client().responses.create(
-        model=model or os.getenv("QWEN_MODEL", DEFAULT_MODEL),
-        input=[
+    completion = _client().chat.completions.create(
+        model=model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL),
+        extra_headers=_extra_headers(),
+        messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": _data_url(annotated)},
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _data_url(annotated)},
+                    },
                 ],
             }
         ],
-        max_output_tokens=int(max_output_tokens),
-        extra_body={"enable_thinking": bool(enable_thinking)},
+        max_tokens=int(max_tokens),
+        temperature=temperature,
     )
 
-    answer = str(getattr(response, "output_text", "") or "").strip()
+    answer = str(completion.choices[0].message.content or "").strip()
     if not answer:
-        raise RuntimeError("the model returned no text; try raising max_output_tokens")
+        raise RuntimeError("the model returned no text; try raising max_tokens")
 
     width, height = image.size
     return parse_detections(answer, width, height), answer
