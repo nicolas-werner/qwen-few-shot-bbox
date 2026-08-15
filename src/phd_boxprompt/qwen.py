@@ -24,6 +24,7 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 __all__ = [
+    "BoxPromptResult",
     "Detection",
     "annotate_prompt_boxes",
     "detect_similar",
@@ -212,6 +213,50 @@ For reference, the prompt boxes in normalized XYXY coordinates are: {box_summary
 """.strip()
 
 
+def _extract_reasoning(message: Any) -> str:
+    """Pull the reasoning trace out of an OpenRouter message, if the provider sent one.
+
+    OpenRouter exposes it as ``message.reasoning`` (plain text) and/or
+    ``message.reasoning_details`` (a list of blocks). Neither is guaranteed —
+    some providers strip it, some models have none. Returns "" when absent.
+    """
+    reasoning = getattr(message, "reasoning", None)
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+
+    details = getattr(message, "reasoning_details", None)
+    if not details:
+        # Non-standard fields survive on model_extra rather than as attributes.
+        extra = getattr(message, "model_extra", None) or {}
+        if isinstance(extra.get("reasoning"), str):
+            return str(extra["reasoning"]).strip()
+        details = extra.get("reasoning_details")
+
+    blocks: list[str] = []
+    for block in details or []:
+        if isinstance(block, dict):
+            text = block.get("text") or block.get("summary") or block.get("data")
+        else:
+            text = getattr(block, "text", None) or getattr(block, "summary", None)
+        if isinstance(text, str) and text.strip():
+            blocks.append(text.strip())
+    return "\n\n".join(blocks)
+
+
+@dataclass(frozen=True)
+class BoxPromptResult:
+    """One box-prompt run: what came back, and how the model got there."""
+
+    detections: list[Detection]
+    answer: str
+    reasoning: str = ""
+    model: str = ""
+
+    def __iter__(self):
+        """Backwards-compatible ``detections, answer = detect_similar(...)``."""
+        return iter((self.detections, self.answer))
+
+
 def detect_similar(
     image: Image.Image,
     boxes: list[dict[str, Any]],
@@ -220,11 +265,17 @@ def detect_similar(
     model: str | None = None,
     max_tokens: int = 8192,
     temperature: float = 0.0,
-) -> tuple[list[Detection], str]:
-    """Run one few-shot box prompt. Returns ``(detections, raw_answer)``.
+    reasoning: bool | str = True,
+) -> BoxPromptResult:
+    """Run one few-shot box prompt.
 
     ``boxes`` is the widget's value: ``[{"box": [x1, y1, x2, y2], "kind": ...}]``
     in original-image pixels. At least one positive box is required.
+
+    ``reasoning`` asks OpenRouter for the model's reasoning trace. Pass ``True``
+    to simply enable it, an effort level (``"low"``/``"medium"``/``"high"``) to
+    tune it, or ``False`` to skip. Providers that do not support it are handled
+    by retrying once without the parameter, so this never hard-fails a run.
     """
     if not any(b.get("kind") == "positive" for b in boxes):
         raise ValueError("draw at least one positive box before running detection")
@@ -237,11 +288,12 @@ def detect_similar(
         box_summary=normalized_box_summary(image, boxes),
     )
     annotated = annotate_prompt_boxes(image, boxes)
+    resolved_model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
 
-    completion = _client().chat.completions.create(
-        model=model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL),
-        extra_headers=_extra_headers(),
-        messages=[
+    request: dict[str, Any] = {
+        "model": resolved_model,
+        "extra_headers": _extra_headers(),
+        "messages": [
             {
                 "role": "user",
                 "content": [
@@ -253,13 +305,36 @@ def detect_similar(
                 ],
             }
         ],
-        max_tokens=int(max_tokens),
-        temperature=temperature,
-    )
+        "max_tokens": int(max_tokens),
+        "temperature": temperature,
+    }
 
-    answer = str(completion.choices[0].message.content or "").strip()
+    if reasoning:
+        request["extra_body"] = {
+            "reasoning": (
+                {"effort": reasoning} if isinstance(reasoning, str) else {"enabled": True}
+            )
+        }
+
+    client = _client()
+    try:
+        completion = client.chat.completions.create(**request)
+    except Exception:
+        if not reasoning:
+            raise
+        # The provider rejected the reasoning parameter — rerun plainly.
+        request.pop("extra_body", None)
+        completion = client.chat.completions.create(**request)
+
+    message = completion.choices[0].message
+    answer = str(message.content or "").strip()
     if not answer:
         raise RuntimeError("the model returned no text; try raising max_tokens")
 
     width, height = image.size
-    return parse_detections(answer, width, height), answer
+    return BoxPromptResult(
+        detections=parse_detections(answer, width, height),
+        answer=answer,
+        reasoning=_extract_reasoning(message),
+        model=resolved_model,
+    )

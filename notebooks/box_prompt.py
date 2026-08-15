@@ -101,27 +101,39 @@ def _(boxes, detect_similar, image, instruction, mo, run):
     mo.stop(not run.value, mo.md("*Draw your boxes, then click **Run detection**.*"))
 
     with mo.status.spinner(title="Asking the model…"):
-        detections, raw_answer = detect_similar(image, boxes, instruction.value)
-    return detections, raw_answer
+        result = detect_similar(image, boxes, instruction.value, reasoning=True)
+    return (result,)
 
 
 @app.cell
-def _(boxes, detections, draw_detections, image, mo):
+def _(boxes, draw_detections, image, mo, result):
     mo.vstack(
         [
-            mo.md(f"### {len(detections)} match(es)"),
-            mo.image(draw_detections(image, boxes, detections), width=900),
+            mo.md(f"### {len(result.detections)} match(es)"),
+            mo.image(draw_detections(image, boxes, result.detections), width=900),
         ]
     )
     return
 
 
 @app.cell
-def _(boxes, detections, instruction, json, mo, raw_answer):
+def _(mo, result):
+    mo.md(
+        f"## Reasoning\n\n{result.reasoning}"
+        if result.reasoning
+        else "## Reasoning\n\n*This provider returned no reasoning trace for the run.*"
+    )
+    return
+
+
+@app.cell
+def _(boxes, instruction, json, mo, result):
     record = {
+        "model": result.model,
         "instruction": instruction.value,
         "prompt_boxes": boxes,
-        "detections": [{"box": list(d.box), "label": d.label} for d in detections],
+        "detections": [{"box": list(d.box), "label": d.label} for d in result.detections],
+        "reasoning": result.reasoning,
     }
 
     mo.accordion(
@@ -129,7 +141,7 @@ def _(boxes, detections, instruction, json, mo, raw_answer):
             "Result as JSON (copy this into your notes)": mo.md(
                 f"```json\n{json.dumps(record, indent=2)}\n```"
             ),
-            "Raw model response": mo.md(f"```json\n{raw_answer}\n```"),
+            "Raw model response": mo.md(f"```json\n{result.answer}\n```"),
         }
     )
     return

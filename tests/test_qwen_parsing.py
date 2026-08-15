@@ -68,3 +68,50 @@ def test_widget_reports_original_size_even_when_preview_is_downscaled():
     assert (widget.img_width, widget.img_height) == (4000, 3000)
     assert widget.image.startswith("data:image/jpeg;base64,")
     assert widget.boxes == []
+
+
+class _Message:
+    """Stand-in for the SDK's message object."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_reasoning_read_from_plain_field():
+    from phd_boxprompt.qwen import _extract_reasoning
+
+    assert _extract_reasoning(_Message(reasoning="  I counted the bands.  ")) == (
+        "I counted the bands."
+    )
+
+
+def test_reasoning_read_from_detail_blocks():
+    from phd_boxprompt.qwen import _extract_reasoning
+
+    message = _Message(
+        reasoning=None,
+        reasoning_details=[{"text": "first"}, {"summary": "second"}, {"text": "  "}],
+    )
+    assert _extract_reasoning(message) == "first\n\nsecond"
+
+
+def test_reasoning_read_from_model_extra():
+    from phd_boxprompt.qwen import _extract_reasoning
+
+    message = _Message(model_extra={"reasoning": "hidden here"})
+    assert _extract_reasoning(message) == "hidden here"
+
+
+def test_reasoning_absent_is_empty_not_an_error():
+    from phd_boxprompt.qwen import _extract_reasoning
+
+    assert _extract_reasoning(_Message()) == ""
+
+
+def test_result_still_unpacks_as_a_pair():
+    from phd_boxprompt.qwen import BoxPromptResult, Detection
+
+    result = BoxPromptResult([Detection((0, 0, 1, 1), "match")], "raw", "why", "m")
+    detections, answer = result
+    assert answer == "raw"
+    assert detections[0].label == "match"

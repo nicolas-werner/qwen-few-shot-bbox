@@ -54,3 +54,15 @@ tests/                        parsing tests (no network)
   provider allows.
 - Whatever prompt string you use is part of the method. Record it with the
   results — it defines what counts as the object.
+
+## Reasoning trace
+
+`detect_similar(..., reasoning=True)` asks OpenRouter for the model's reasoning
+and returns it on `BoxPromptResult.reasoning`; the notebook shows it under the
+result image and includes it in the JSON record. Pass an effort level
+(`"low"`/`"medium"`/`"high"`) instead of `True` to tune it, or `False` to skip.
+
+Providers that reject the parameter are retried once without it, and a model
+that simply returns no trace yields `""` — never an error. So an empty
+reasoning field means *the provider sent none*, not *the model did not think*.
+That distinction matters if you plan to cite the trace as evidence.
