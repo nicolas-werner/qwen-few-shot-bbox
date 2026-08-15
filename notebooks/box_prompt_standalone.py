@@ -390,6 +390,7 @@ def _():
 
 
     import base64
+    import codecs
     import io
     import json
     import os
@@ -615,6 +616,53 @@ def _():
             return str(extra["reasoning"])
         blocks = extra.get("reasoning_details") or []
         return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+
+
+    def _split_sse_frames(buffer: str) -> tuple[list[str], str]:
+        """Split an SSE buffer into complete ``data:`` payloads plus the remainder.
+
+        A network chunk can end mid-frame, so whatever follows the last blank line
+        is handed back to be prepended to the next chunk. Comment lines (OpenRouter
+        sends ``: OPENROUTER PROCESSING`` as a keep-alive) are dropped.
+        """
+        normalized = buffer.replace("\r\n", "\n")
+        payloads: list[str] = []
+
+        while "\n\n" in normalized:
+            frame, normalized = normalized.split("\n\n", 1)
+            for line in frame.split("\n"):
+                line = line.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    payloads.append(line[len("data:") :].strip())
+
+        return payloads, normalized
+
+
+    def _mapping_delta_parts(payload: str) -> tuple[str, str]:
+        """``(answer, reasoning)`` carried by one SSE payload. ``("", "")`` if none."""
+        if not payload or payload == "[DONE]":
+            return "", ""
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return "", ""
+
+        choices = data.get("choices") or []
+        if not choices:
+            return "", ""
+        delta = choices[0].get("delta") or {}
+
+        answer = delta.get("content") or ""
+        reasoning = delta.get("reasoning") or ""
+        if not reasoning:
+            reasoning = "".join(
+                block.get("text", "")
+                for block in (delta.get("reasoning_details") or [])
+                if isinstance(block, dict)
+            )
+        return str(answer), str(reasoning)
 
 
     # --------------------------------------------------------------------------- #
@@ -844,6 +892,49 @@ def _():
     # --------------------------------------------------------------------------- #
 
 
+    async def _consume_pyfetch_stream(
+        response: Any,
+        on_chunk: Callable[[str, str], None],
+    ) -> tuple[str, str]:
+        """Read an SSE response body chunk by chunk. Returns ``(answer, reasoning)``.
+
+        Bytes are decoded incrementally, because a multi-byte character can be split
+        across two network chunks; the same is true of SSE frames, which is what the
+        leftover buffer is for.
+        """
+        reader = response.js_response.body.getReader()
+        decoder = codecs.getincrementaldecoder("utf-8")()
+
+        buffer = ""
+        answer_parts: list[str] = []
+        reasoning_parts: list[str] = []
+
+        while True:
+            chunk = await reader.read()
+            if chunk.done:
+                break
+
+            buffer += decoder.decode(bytes(chunk.value.to_py()))
+            payloads, buffer = _split_sse_frames(buffer)
+
+            changed = False
+            for payload in payloads:
+                if payload == "[DONE]":
+                    continue
+                answer, thought = _mapping_delta_parts(payload)
+                if answer:
+                    answer_parts.append(answer)
+                    changed = True
+                if thought:
+                    reasoning_parts.append(thought)
+                    changed = True
+
+            if changed:
+                on_chunk("".join(reasoning_parts), "".join(answer_parts))
+
+        return "".join(answer_parts), "".join(reasoning_parts)
+
+
     async def adetect_similar(
         image: Image.Image,
         boxes: list[dict[str, Any]],
@@ -854,14 +945,19 @@ def _():
         max_tokens: int = 8192,
         temperature: float = 0.0,
         reasoning: bool | str = True,
+        on_chunk: Callable[[str, str], None] | None = None,
     ) -> BoxPromptResult:
         """Run one few-shot box prompt from a browser (Pyodide) notebook.
 
         Uses ``pyodide.http.pyfetch`` because the ``openai`` SDK needs sockets that
         WASM does not provide. OpenRouter serves permissive CORS headers, so the
-        request works directly from the page. No streaming on this path.
+        request works directly from the page.
+
+        Pass ``on_chunk`` to stream, exactly as with :func:`detect_similar`. The
+        browser hands us a ``ReadableStream`` rather than an SSE client, so the
+        frames are parsed here.
         """
-        from pyodide.http import pyfetch  # noqa: PLC0415 — only exists in Pyodide
+        from pyodide.http import pyfetch  # only exists inside Pyodide
 
         payload = build_payload(
             image,
@@ -874,6 +970,10 @@ def _():
         )
         base = os.getenv("OPENROUTER_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 
+        streaming = on_chunk is not None
+        if streaming:
+            payload["stream"] = True
+
         response = await pyfetch(
             f"{base}/chat/completions",
             method="POST",
@@ -884,17 +984,17 @@ def _():
             detail = (await response.string())[:400]
             raise RuntimeError(f"OpenRouter returned HTTP {response.status}: {detail}")
 
-        data = await response.json()
-        if error := data.get("error"):
-            raise RuntimeError(f"OpenRouter error: {error}")
+        if streaming:
+            answer, trace = await _consume_pyfetch_stream(response, on_chunk)
+        else:
+            data = await response.json()
+            if error := data.get("error"):
+                raise RuntimeError(f"OpenRouter error: {error}")
+            message = data["choices"][0]["message"]
+            answer, trace = str(message.get("content") or ""), _extract_reasoning(message)
 
-        message = data["choices"][0]["message"]
-        return _finish(
-            payload,
-            str(message.get("content") or ""),
-            _extract_reasoning(message),
-            image.size,
-        )
+        payload.pop("stream", None)
+        return _finish(payload, answer, trace, image.size)
 
     # A .env file is a convenience, not a requirement — and python-dotenv is not
     # installed in the browser build.
@@ -1050,9 +1150,11 @@ async def _(
     key = api_key_input.value.strip() or None
 
     if running_in_browser():
-        # Pyodide has no sockets, so no streaming here — one awaited fetch.
-        mo.output.replace(mo.md("**Asking the model…** (no live stream in the browser)"))
-        result = await adetect_similar(image, boxes, instruction.value, api_key=key)
+        # Pyodide has no sockets, so this reads the response stream by hand.
+        mo.output.replace(mo.md("**Asking the model…**"))
+        result = await adetect_similar(
+            image, boxes, instruction.value, api_key=key, on_chunk=show_progress
+        )
     else:
         result = detect_similar(
             image, boxes, instruction.value, api_key=key, on_chunk=show_progress

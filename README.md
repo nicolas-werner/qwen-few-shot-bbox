@@ -66,8 +66,12 @@ not work. One-time setup: Settings → Pages → Source: "GitHub Actions", and t
 repository has to be public for the link to work without a login.
 
 In the browser the notebook runs under Pyodide, which has no sockets, so it
-takes the `pyodide.http.pyfetch` path instead of the `openai` SDK. Everything
-works there except live streaming — the response arrives in one go.
+takes the `pyodide.http.pyfetch` path instead of the `openai` SDK. It streams
+there too: the browser hands back a `ReadableStream` rather than an SSE client,
+so `_consume_pyfetch_stream` decodes the bytes incrementally and parses the
+frames itself. Both a multi-byte character and an SSE frame can be split across
+network chunks, which is what the incremental decoder and the leftover buffer
+are for — the cases are covered by tests that need no browser.
 
 Viewers still need their own OpenRouter key; there is a field at the top of the
 notebook. It is typed in at runtime and never written into the page.

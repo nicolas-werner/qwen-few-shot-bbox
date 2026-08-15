@@ -190,9 +190,11 @@ async def _(
     key = api_key_input.value.strip() or None
 
     if running_in_browser():
-        # Pyodide has no sockets, so no streaming here — one awaited fetch.
-        mo.output.replace(mo.md("**Asking the model…** (no live stream in the browser)"))
-        result = await adetect_similar(image, boxes, instruction.value, api_key=key)
+        # Pyodide has no sockets, so this reads the response stream by hand.
+        mo.output.replace(mo.md("**Asking the model…**"))
+        result = await adetect_similar(
+            image, boxes, instruction.value, api_key=key, on_chunk=show_progress
+        )
     else:
         result = detect_similar(
             image, boxes, instruction.value, api_key=key, on_chunk=show_progress

@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -30,6 +31,8 @@ DEFAULT_OUTPUT = ROOT / "dist"
 
 
 def export(output: Path, mode: str) -> None:
+    started = time.monotonic()
+
     with tempfile.TemporaryDirectory() as raw:
         staging = Path(raw)
         shutil.copy2(NOTEBOOK, staging / NOTEBOOK.name)
@@ -38,33 +41,55 @@ def export(output: Path, mode: str) -> None:
             staging / PACKAGE.name,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
+        staged = time.monotonic()
 
-        built = staging / "out"
-        subprocess.run(
+        # Export straight to the final location. Writing into the staging dir
+        # and moving afterwards would copy ~700 files twice whenever the temp
+        # dir is on another volume, which is most of the cost on macOS.
+        #
+        # Captured, not streamed: marimo prints a "serve it from <cwd>" hint
+        # that would be misleading. Its output is surfaced only on failure.
+        finished = subprocess.run(
             [
                 "marimo", "export", "html-wasm", NOTEBOOK.name,
-                "-o", str(built), "--mode", mode, "--force",
+                "-o", str(output.resolve()), "--mode", mode, "--force",
             ],
             cwd=staging,
-            check=True,
+            capture_output=True,
+            text=True,
         )
+        if finished.returncode != 0:
+            sys.stderr.write(finished.stdout + finished.stderr)
+            raise SystemExit(f"marimo export failed (exit {finished.returncode})")
 
-        wheels = sorted((built / "public" / "wheels").glob("phd_boxprompt-*.whl"))
-        if not wheels:
-            raise SystemExit(
-                "phd_boxprompt was not bundled — the notebook would fail in the "
-                "browser with an ImportError. Check that marimo can see `uv`."
-            )
+        exported = time.monotonic()
 
-        if output.exists():
-            shutil.rmtree(output)
-        shutil.move(str(built), str(output))
-        print(f"bundled {wheels[0].name}")
+    wheels = sorted((output / "public" / "wheels").glob("phd_boxprompt-*.whl"))
+    if not wheels:
+        raise SystemExit(
+            "phd_boxprompt was not bundled — the notebook would fail in the "
+            "browser with an ImportError. Check that marimo can see `uv`."
+        )
+    written = sum(1 for _ in output.rglob("*") if _.is_file())
+    print(
+        f"bundled {wheels[0].name}\n"
+        f"staged in {staged - started:.1f}s, "
+        f"exported {written} files in {exported - staged:.1f}s"
+    )
 
     index = output / "index.html"
     if not index.is_file():
         raise SystemExit(f"no index.html in {output}")
-    print(f"wrote {output}/  —  serve it: python -m http.server --directory {output.name}")
+
+    try:
+        shown = output.relative_to(Path.cwd())
+    except ValueError:
+        shown = output
+
+    print(f"\nWrote {shown}/")
+    print(f"\n    python -m http.server --directory {shown}\n")
+    print("Then open http://localhost:8000 — first load takes 20-60s while")
+    print("Pyodide and the wheels install. file:// will not work.")
 
 
 def main() -> int:

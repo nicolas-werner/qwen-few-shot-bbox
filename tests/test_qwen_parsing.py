@@ -200,3 +200,54 @@ def test_standalone_notebook_is_up_to_date():
     generated = build_standalone.build()
     on_disk = build_standalone.OUTPUT_NOTEBOOK.read_text()
     assert generated == on_disk, "box_prompt_standalone.py is stale — rebuild it"
+
+
+# --- SSE framing (the browser transport) ------------------------------------
+
+
+def test_sse_splits_complete_frames_and_keeps_the_remainder():
+    from phd_boxprompt.qwen import _split_sse_frames
+
+    payloads, rest = _split_sse_frames('data: {"a":1}\n\ndata: {"b":2}\n\ndata: {"c"')
+    assert payloads == ['{"a":1}', '{"b":2}']
+    assert rest == 'data: {"c"'
+
+
+def test_sse_frame_split_across_two_chunks_is_recovered():
+    """A network chunk can end mid-frame; the leftover must carry over."""
+    from phd_boxprompt.qwen import _split_sse_frames
+
+    first, second = 'data: {"choices":[{"delta":{"con', 'tent":"hi"}}]}\n\n'
+    payloads, rest = _split_sse_frames(first)
+    assert payloads == []
+    payloads, rest = _split_sse_frames(rest + second)
+    assert payloads == ['{"choices":[{"delta":{"content":"hi"}}]}']
+    assert rest == ""
+
+
+def test_sse_ignores_keepalive_comments_and_crlf():
+    from phd_boxprompt.qwen import _split_sse_frames
+
+    buffer = ": OPENROUTER PROCESSING\r\n\r\ndata: {\"x\":1}\r\n\r\n"
+    payloads, rest = _split_sse_frames(buffer)
+    assert payloads == ['{"x":1}']
+    assert rest == ""
+
+
+def test_delta_parts_reads_content_and_reasoning():
+    from phd_boxprompt.qwen import _mapping_delta_parts
+
+    assert _mapping_delta_parts('{"choices":[{"delta":{"content":"abc"}}]}') == ("abc", "")
+    assert _mapping_delta_parts('{"choices":[{"delta":{"reasoning":"why"}}]}') == ("", "why")
+    assert _mapping_delta_parts(
+        '{"choices":[{"delta":{"reasoning_details":[{"text":"a"},{"text":"b"}]}}]}'
+    ) == ("", "ab")
+
+
+def test_delta_parts_tolerates_done_empty_and_malformed_payloads():
+    from phd_boxprompt.qwen import _mapping_delta_parts
+
+    assert _mapping_delta_parts("[DONE]") == ("", "")
+    assert _mapping_delta_parts("") == ("", "")
+    assert _mapping_delta_parts("not json") == ("", "")
+    assert _mapping_delta_parts('{"choices":[]}') == ("", "")
