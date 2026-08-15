@@ -36,6 +36,7 @@ __all__ = [
     "BoxPromptResult",
     "Detection",
     "adetect_similar",
+    "adetect_similar",
     "annotate_prompt_boxes",
     "detect_similar",
     "draw_detections",
@@ -59,7 +60,7 @@ MISSING_KEY_MESSAGE = (
 
 
 def running_in_browser() -> bool:
-    """True when executing inside Pyodide, i.e. a WASM-exported notebook."""
+    """True when executing inside Pyodide, i.e. the WASM build."""
     return sys.platform == "emscripten"
 
 
@@ -268,6 +269,14 @@ def _attribution_headers() -> dict[str, str]:
     if title := os.getenv("OPENROUTER_SITE_NAME"):
         headers["X-OpenRouter-Title"] = title
     return headers
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        **_attribution_headers(),
+    }
 
 
 def _headers(api_key: str) -> dict[str, str]:

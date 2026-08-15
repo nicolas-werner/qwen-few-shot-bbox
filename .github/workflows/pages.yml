@@ -1,0 +1,62 @@
+name: Publish notebook to GitHub Pages
+
+# Builds the WASM version of notebooks/box_prompt.py and publishes it, so it can
+# be shared as a plain URL — no account, no install. Viewers still need their own
+# OpenRouter key to run detection; there is a field for it in the notebook.
+#
+# One-time setup: repository Settings -> Pages -> Source: "GitHub Actions".
+# The repository must be public for the page to be reachable without a login.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "notebooks/box_prompt.py"
+      - "src/phd_boxprompt/**"
+      - "export_wasm.py"
+      - "pyproject.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Check the generated notebook is not stale
+        run: uv run pytest -q
+
+      - name: Export to WASM
+        run: uv run python export_wasm.py
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -8,8 +8,8 @@
 #     "anywidget>=0.9.13",
 #     "pillow>=10.4.0",
 #     "traitlets>=5.14.3",
-#     "openai>=1.60.0",
-#     "python-dotenv>=1.0.1",
+#     "openai>=1.60.0; sys_platform != 'emscripten'",
+#     "python-dotenv>=1.0.1; sys_platform != 'emscripten'",
 # ]
 # ///
 
@@ -405,6 +405,7 @@ def _():
         "BoxPromptResult",
         "Detection",
         "adetect_similar",
+        "adetect_similar",
         "annotate_prompt_boxes",
         "detect_similar",
         "draw_detections",
@@ -428,7 +429,7 @@ def _():
 
 
     def running_in_browser() -> bool:
-        """True when executing inside Pyodide, i.e. a WASM-exported notebook."""
+        """True when executing inside Pyodide, i.e. the WASM build."""
         return sys.platform == "emscripten"
 
 
@@ -637,6 +638,14 @@ def _():
         if title := os.getenv("OPENROUTER_SITE_NAME"):
             headers["X-OpenRouter-Title"] = title
         return headers
+
+
+    def _headers(api_key: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            **_attribution_headers(),
+        }
 
 
     def _headers(api_key: str) -> dict[str, str]:
@@ -897,6 +906,7 @@ def _():
         pass
     return (
         Image,
+        adetect_similar,
         box_widget,
         detect_similar,
         draw_detections,
@@ -904,6 +914,7 @@ def _():
         json,
         mo,
         os,
+        running_in_browser,
         time,
     )
 
@@ -1006,7 +1017,18 @@ def _(mo, widget):
 
 
 @app.cell
-def _(api_key_input, boxes, detect_similar, image, instruction, mo, run, time):
+async def _(
+    adetect_similar,
+    api_key_input,
+    boxes,
+    detect_similar,
+    image,
+    instruction,
+    mo,
+    run,
+    running_in_browser,
+    time,
+):
     mo.stop(not run.value, mo.md("*Draw your boxes, then click **Run detection**.*"))
 
     # Every replace() re-serialises and broadcasts the whole block, so cap the
@@ -1025,13 +1047,16 @@ def _(api_key_input, boxes, detect_similar, image, instruction, mo, run, time):
         panels.append(mo.md(f"**Response…**\n\n```json\n{answer_so_far or '▌'}\n```"))
         mo.output.replace(mo.vstack(panels))
 
-    result = detect_similar(
-        image,
-        boxes,
-        instruction.value,
-        api_key=api_key_input.value.strip() or None,
-        on_chunk=show_progress,
-    )
+    key = api_key_input.value.strip() or None
+
+    if running_in_browser():
+        # Pyodide has no sockets, so no streaming here — one awaited fetch.
+        mo.output.replace(mo.md("**Asking the model…** (no live stream in the browser)"))
+        result = await adetect_similar(image, boxes, instruction.value, api_key=key)
+    else:
+        result = detect_similar(
+            image, boxes, instruction.value, api_key=key, on_chunk=show_progress
+        )
 
     mo.output.replace(
         mo.md(f"Done — **{len(result.detections)}** match(es) from `{result.model}`.")

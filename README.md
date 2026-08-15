@@ -49,28 +49,42 @@ src/phd_boxprompt/qwen.py            OpenRouter call, prompt, response parsing
 tests/                               parsing + streaming tests (no network)
 ```
 
-## Sharing with molab
+## Sharing
 
-[molab](https://docs.marimo.io/guides/molab/) runs real CPython in the cloud, so
-streaming works there exactly as it does locally. It is single-file, though: it
-syncs one notebook from a GitHub URL and cannot import `phd_boxprompt`. That is
-what `notebooks/box_prompt_standalone.py` is for — the same notebook with the package
-inlined into its first cell.
+### GitHub Pages (a plain URL, no account)
+
+`export_wasm.py` builds a self-contained browser version. Push to `main` and the
+Pages workflow publishes it; or build it yourself:
 
 ```bash
-uv run python build_standalone.py     # after any change to the notebook or package
+uv run python export_wasm.py
+python -m http.server --directory dist    # then open the printed URL
 ```
 
-Then push and point molab at the GitHub URL of
-`notebooks/box_prompt_standalone.py`. A test fails if the
-generated file drifts from its sources, so it cannot go stale silently.
+It **must** be served over HTTP — opening `dist/index.html` via `file://` will
+not work. One-time setup: Settings → Pages → Source: "GitHub Actions", and the
+repository has to be public for the link to work without a login.
 
-Two things to tell whoever you share it with:
+In the browser the notebook runs under Pyodide, which has no sockets, so it
+takes the `pyodide.http.pyfetch` path instead of the `openai` SDK. Everything
+works there except live streaming — the response arrives in one go.
 
-- They need their own OpenRouter key — there is a field at the top of the
-  notebook. It is typed in at runtime and never written into the file.
-- molab notebooks are **public but undiscoverable**: anyone with the link can
-  read the code. Nothing secret lives in it, but it is not private.
+Viewers still need their own OpenRouter key; there is a field at the top of the
+notebook. It is typed in at runtime and never written into the page.
+
+### molab (fallback)
+
+[molab](https://docs.marimo.io/guides/molab/) runs real CPython, so streaming
+works, but viewers need an account. It is also single-file and cannot import
+`phd_boxprompt`, which is what `notebooks/box_prompt_standalone.py` is for — the
+same notebook with the package inlined into its first cell:
+
+```bash
+uv run python build_standalone.py     # after changing the notebook or package
+```
+
+A test fails if that generated file drifts from its sources, so it cannot go
+stale silently.
 
 ## Notes
 
