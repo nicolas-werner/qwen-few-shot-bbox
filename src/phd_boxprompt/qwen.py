@@ -1,0 +1,246 @@
+"""Few-shot box prompting against Qwen3.8-Max on the DashScope compatible endpoint.
+
+The trick borrowed from the Gradio reference app: the example boxes are *drawn
+onto* the image before sending, and additionally passed as normalized
+coordinates in the text prompt. The model sees the exemplars both ways.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+__all__ = [
+    "Detection",
+    "annotate_prompt_boxes",
+    "detect_similar",
+    "draw_detections",
+    "parse_detections",
+]
+
+DEFAULT_MODEL = "qwen3.8-max"
+DEFAULT_BASE_URL = (
+    "https://dashscope-intl.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1"
+)
+
+POSITIVE_COLOR = "#16a34a"
+NEGATIVE_COLOR = "#dc2626"
+MATCH_COLOR = "#2563eb"
+
+
+@dataclass(frozen=True)
+class Detection:
+    """One returned box, in original-image pixels."""
+
+    box: tuple[int, int, int, int]
+    label: str
+
+
+# --------------------------------------------------------------------------- #
+# image helpers
+# --------------------------------------------------------------------------- #
+
+
+def _data_url(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=95)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def annotate_prompt_boxes(
+    image: Image.Image,
+    boxes: list[dict[str, Any]],
+) -> Image.Image:
+    """Return a copy of ``image`` with the exemplar boxes painted on it."""
+    canvas = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(canvas)
+    line_width = max(3, round(min(canvas.size) / 180))
+
+    for index, annotation in enumerate(boxes, start=1):
+        x1, y1, x2, y2 = (int(v) for v in annotation["box"])
+        positive = annotation.get("kind") == "positive"
+        color = POSITIVE_COLOR if positive else NEGATIVE_COLOR
+        label = f" {'+' if positive else '-'}{index} "
+        draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width)
+        text_box = draw.textbbox((x1, y1), label)
+        draw.rectangle(text_box, fill=color)
+        draw.text((x1, y1), label, fill="white")
+
+    return canvas
+
+
+def draw_detections(
+    image: Image.Image,
+    prompt_boxes: list[dict[str, Any]],
+    detections: list[Detection],
+) -> Image.Image:
+    """Paint exemplars (green/red) and model matches (blue) onto a copy."""
+    canvas = annotate_prompt_boxes(image, prompt_boxes)
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    line_width = max(2, round(min(canvas.size) / 260))
+
+    for detection in detections:
+        draw.rectangle(detection.box, outline=MATCH_COLOR, width=line_width)
+        draw.rectangle(detection.box, fill=(37, 99, 235, 40))
+
+    return canvas
+
+
+def normalized_box_summary(image: Image.Image, boxes: list[dict[str, Any]]) -> str:
+    """Exemplar boxes as 0-1000 normalized XYXY, for the text half of the prompt."""
+    width, height = image.size
+    parts = []
+    for annotation in boxes:
+        x1, y1, x2, y2 = annotation["box"]
+        normalized = [
+            round(1000 * x1 / width),
+            round(1000 * y1 / height),
+            round(1000 * x2 / width),
+            round(1000 * y2 / height),
+        ]
+        parts.append(f"{annotation.get('kind', 'positive')}: {normalized}")
+    return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# response parsing
+# --------------------------------------------------------------------------- #
+
+
+def parse_detections(
+    answer: str,
+    width: int,
+    height: int,
+    preserve_labels: bool = False,
+) -> list[Detection]:
+    """Pull ``{"objects": [{"box_2d": [...]}]}`` out of the model's text.
+
+    Raises ``ValueError`` if nothing parseable is found. It deliberately does not
+    return an empty list on failure, so a parse error is never silently read as
+    "the model found nothing".
+    """
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", answer, flags=re.IGNORECASE)
+    candidate = fenced.group(1) if fenced else answer
+
+    object_match = re.search(r"\{[\s\S]*\}", candidate)
+    list_match = re.search(r"\[[\s\S]*\]", candidate)
+    if not (object_match or list_match):
+        raise ValueError("no JSON object or array found in the model response")
+
+    payload = json.loads((object_match or list_match).group(0))
+    objects = payload.get("objects", []) if isinstance(payload, dict) else payload
+
+    detections: list[Detection] = []
+    for item in objects:
+        coordinates = item.get("box_2d") or item.get("bbox") or item.get("box")
+        if not isinstance(coordinates, list) or len(coordinates) != 4:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in coordinates)
+        x1, x2 = sorted((max(0.0, min(1000.0, x1)), max(0.0, min(1000.0, x2))))
+        y1, y2 = sorted((max(0.0, min(1000.0, y1)), max(0.0, min(1000.0, y2))))
+        pixel_box = (
+            round(x1 * width / 1000),
+            round(y1 * height / 1000),
+            round(x2 * width / 1000),
+            round(y2 * height / 1000),
+        )
+        label = str(item.get("label") or "match")[:80] if preserve_labels else "match"
+        detections.append(Detection(box=pixel_box, label=label))
+
+    return detections
+
+
+# --------------------------------------------------------------------------- #
+# the API call
+# --------------------------------------------------------------------------- #
+
+
+def _client(timeout: float = 180.0):
+    from openai import OpenAI
+
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "DASHSCOPE_API_KEY is not set. Copy .env.example to .env and fill it in."
+        )
+    return OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("QWEN_BASE_URL", DEFAULT_BASE_URL),
+        timeout=timeout,
+        max_retries=2,
+    )
+
+
+PROMPT_TEMPLATE = """
+The image contains visual box prompts drawn by the user. Green boxes marked with + are \
+positive examples of the object to find. Red boxes marked with - are negative examples \
+that must be ignored.
+
+The user's instruction is: {instruction}
+
+Find every other unboxed object in this same image that matches the positive examples \
+while respecting the negative examples. Return only valid JSON in this exact shape:
+
+{{"objects": [{{"label": "match", "box_2d": [x_min, y_min, x_max, y_max]}}]}}
+
+Use XYXY coordinates normalized to integers from 0 to 1000. Do not return the already \
+marked prompt boxes. If there are no additional matches, return {{"objects": []}}.
+
+For reference, the prompt boxes in normalized XYXY coordinates are: {box_summary}
+""".strip()
+
+
+def detect_similar(
+    image: Image.Image,
+    boxes: list[dict[str, Any]],
+    instruction: str = "",
+    *,
+    model: str | None = None,
+    enable_thinking: bool = False,
+    max_output_tokens: int = 8192,
+) -> tuple[list[Detection], str]:
+    """Run one few-shot box prompt. Returns ``(detections, raw_answer)``.
+
+    ``boxes`` is the widget's value: ``[{"box": [x1, y1, x2, y2], "kind": ...}]``
+    in original-image pixels. At least one positive box is required.
+    """
+    if not any(b.get("kind") == "positive" for b in boxes):
+        raise ValueError("draw at least one positive box before running detection")
+
+    instruction = instruction.strip() or (
+        "Find every other unboxed object that visually matches the positive examples."
+    )
+    prompt = PROMPT_TEMPLATE.format(
+        instruction=instruction,
+        box_summary=normalized_box_summary(image, boxes),
+    )
+    annotated = annotate_prompt_boxes(image, boxes)
+
+    response = _client().responses.create(
+        model=model or os.getenv("QWEN_MODEL", DEFAULT_MODEL),
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": _data_url(annotated)},
+                ],
+            }
+        ],
+        max_output_tokens=int(max_output_tokens),
+        extra_body={"enable_thinking": bool(enable_thinking)},
+    )
+
+    answer = str(getattr(response, "output_text", "") or "").strip()
+    if not answer:
+        raise RuntimeError("the model returned no text; try raising max_output_tokens")
+
+    width, height = image.size
+    return parse_detections(answer, width, height), answer

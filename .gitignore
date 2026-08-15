@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+
+# notebook scratch output
+out/
+data/raw/
+data/interim/
+__marimo__/
+.repo-bootstrap.tar.gz
