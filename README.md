@@ -14,11 +14,15 @@ result can be compared against a real annotation.
 uv sync
 ```
 
-Then paste your OpenRouter key into `.env` (already created, gitignored):
+A key is needed to run detection. Either paste it into the field at the top of
+the notebook, or put it in `.env` (gitignored) so you don't retype it:
 
 ```
 OPENROUTER_API_KEY=sk-or-...
 ```
+
+The `.env` is optional — the notebook works without one, and the browser/molab
+copy has no `.env` at all.
 
 Model defaults to `qwen/qwen3.8-max`. Override with `OPENROUTER_MODEL` — e.g.
 `qwen/qwen3.8-2.4t-a95b` for the open-weight release, or any other vision model
@@ -37,11 +41,36 @@ detection*. The API is only called on that click.
 ## Layout
 
 ```
-notebooks/box_prompt.py       the notebook
-src/phd_boxprompt/widget.py   BoxDrawWidget — anywidget canvas, drag to draw
-src/phd_boxprompt/qwen.py     DashScope call, prompt template, response parsing
-tests/                        parsing tests (no network)
+notebooks/box_prompt.py              the notebook — source of truth
+notebooks/box_prompt_standalone.py   generated single file for molab (do not edit)
+build_standalone.py                  regenerates the above
+src/phd_boxprompt/widget.py          BoxDrawWidget — anywidget canvas, drag to draw
+src/phd_boxprompt/qwen.py            OpenRouter call, prompt, response parsing
+tests/                               parsing + streaming tests (no network)
 ```
+
+## Sharing with molab
+
+[molab](https://docs.marimo.io/guides/molab/) runs real CPython in the cloud, so
+streaming works there exactly as it does locally. It is single-file, though: it
+syncs one notebook from a GitHub URL and cannot import `phd_boxprompt`. That is
+what `notebooks/box_prompt_standalone.py` is for — the same notebook with the package
+inlined into its first cell.
+
+```bash
+uv run python build_standalone.py     # after any change to the notebook or package
+```
+
+Then push and point molab at the GitHub URL of
+`notebooks/box_prompt_standalone.py`. A test fails if the
+generated file drifts from its sources, so it cannot go stale silently.
+
+Two things to tell whoever you share it with:
+
+- They need their own OpenRouter key — there is a field at the top of the
+  notebook. It is typed in at runtime and never written into the file.
+- molab notebooks are **public but undiscoverable**: anyone with the link can
+  read the code. Nothing secret lives in it, but it is not private.
 
 ## Notes
 
@@ -54,6 +83,16 @@ tests/                        parsing tests (no network)
   provider allows.
 - Whatever prompt string you use is part of the method. Record it with the
   results — it defines what counts as the object.
+
+## Streaming
+
+`detect_similar(..., on_chunk=fn)` streams: `fn(reasoning_so_far, answer_so_far)`
+is called after every delta. The notebook uses it with `mo.output.replace` so the
+reasoning and the JSON appear as they are generated. Omit `on_chunk` and the call
+is a single blocking request instead.
+
+Keep-alive and usage frames (which carry no choices) are skipped, so the
+progress callback only fires on real content.
 
 ## Reasoning trace
 

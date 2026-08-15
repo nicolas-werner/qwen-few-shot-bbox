@@ -1,3 +1,15 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "marimo",
+#     "anywidget>=0.9.13",
+#     "pillow>=10.4.0",
+#     "traitlets>=5.14.3",
+#     "openai>=1.60.0",
+#     "python-dotenv>=1.0.1",
+# ]
+# ///
+
 import marimo
 
 __generated_with = "0.23.16"
@@ -8,15 +20,25 @@ app = marimo.App(width="medium")
 def _():
     import io
     import json
+    import os
+    import time
 
     import marimo as mo
-    from dotenv import load_dotenv
     from PIL import Image
 
+    # <<<INLINE-IMPORTS>>>
     from phd_boxprompt.qwen import detect_similar, draw_detections
     from phd_boxprompt.widget import box_widget
+    # <<<END-INLINE-IMPORTS>>>
 
-    load_dotenv()
+    # A .env file is a convenience, not a requirement — and python-dotenv is not
+    # installed in the browser build.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:
+        pass
     return (
         Image,
         box_widget,
@@ -25,6 +47,8 @@ def _():
         io,
         json,
         mo,
+        os,
+        time,
     )
 
 
@@ -39,6 +63,35 @@ def _(mo):
         """
     )
     return
+
+
+@app.cell
+def _(mo, os):
+    api_key_input = mo.ui.text(
+        label="OpenRouter API key",
+        placeholder="sk-or-…",
+        kind="password",
+        full_width=True,
+    )
+    key_from_env = bool((os.getenv("OPENROUTER_API_KEY") or "").strip())
+    return api_key_input, key_from_env
+
+
+@app.cell
+def _(api_key_input, key_from_env, mo):
+    if api_key_input.value.strip():
+        key_status = "Using the key you pasted below."
+    elif key_from_env:
+        key_status = "Using `OPENROUTER_API_KEY` from the environment — no need to paste one."
+    else:
+        key_status = (
+            "No key found. Paste one below — get a free key at "
+            "[openrouter.ai/keys](https://openrouter.ai/keys). "
+            "It stays in this browser tab and is never written to disk."
+        )
+
+    mo.vstack([mo.callout(mo.md(key_status), kind="info"), api_key_input])
+    return (key_status,)
 
 
 @app.cell
@@ -97,11 +150,36 @@ def _(mo, widget):
 
 
 @app.cell
-def _(boxes, detect_similar, image, instruction, mo, run):
+def _(api_key_input, boxes, detect_similar, image, instruction, mo, run, time):
     mo.stop(not run.value, mo.md("*Draw your boxes, then click **Run detection**.*"))
 
-    with mo.status.spinner(title="Asking the model…"):
-        result = detect_similar(image, boxes, instruction.value, reasoning=True)
+    # Every replace() re-serialises and broadcasts the whole block, so cap the
+    # refresh rate rather than repainting on each token.
+    last_paint = [0.0]
+    REFRESH_SECONDS = 0.1
+
+    def show_progress(reasoning_so_far: str, answer_so_far: str) -> None:
+        now = time.monotonic()
+        if now - last_paint[0] < REFRESH_SECONDS:
+            return
+        last_paint[0] = now
+        panels = []
+        if reasoning_so_far:
+            panels.append(mo.md(f"**Reasoning…**\n\n{reasoning_so_far}"))
+        panels.append(mo.md(f"**Response…**\n\n```json\n{answer_so_far or '▌'}\n```"))
+        mo.output.replace(mo.vstack(panels))
+
+    result = detect_similar(
+        image,
+        boxes,
+        instruction.value,
+        api_key=api_key_input.value.strip() or None,
+        on_chunk=show_progress,
+    )
+
+    mo.output.replace(
+        mo.md(f"Done — **{len(result.detections)}** match(es) from `{result.model}`.")
+    )
     return (result,)
 
 

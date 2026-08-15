@@ -115,3 +115,88 @@ def test_result_still_unpacks_as_a_pair():
     detections, answer = result
     assert answer == "raw"
     assert detections[0].label == "match"
+
+
+class _Delta:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _Choice:
+    def __init__(self, delta):
+        self.delta = delta
+
+
+class _Chunk:
+    def __init__(self, choices):
+        self.choices = choices
+
+
+class _FakeCompletions:
+    """Replays a canned stream and records the request it was given."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.request = None
+
+    def create(self, **kwargs):
+        self.request = kwargs
+        assert kwargs.get("stream") is True
+        return iter(self.chunks)
+
+
+class _FakeClient:
+    def __init__(self, chunks):
+        self.chat = _Delta(completions=_FakeCompletions(chunks))
+
+
+def test_stream_accumulates_answer_and_reasoning_and_reports_progress():
+    from phd_boxprompt.qwen import _consume_stream
+
+    chunks = [
+        _Chunk([]),  # keep-alive frame with no choices
+        _Chunk([_Choice(_Delta(content=None, reasoning="I see "))]),
+        _Chunk([_Choice(_Delta(content=None, reasoning="two bands."))]),
+        _Chunk([_Choice(_Delta(content='{"objects":', reasoning=None))]),
+        _Chunk([_Choice(_Delta(content=" []}", reasoning=None))]),
+        _Chunk([_Delta(delta=None)]),  # malformed frame, must not crash
+    ]
+    seen = []
+    client = _FakeClient(chunks)
+    answer, reasoning = _consume_stream(client, {"model": "m"}, lambda r, a: seen.append((r, a)))
+
+    assert answer == '{"objects": []}'
+    assert reasoning == "I see two bands."
+    assert len(seen) == 4
+    assert seen[0] == ("I see ", "")
+    assert seen[-1] == ("I see two bands.", '{"objects": []}')
+
+
+def test_stream_reads_reasoning_from_model_extra_deltas():
+    from phd_boxprompt.qwen import _delta_reasoning
+
+    assert _delta_reasoning(_Delta(reasoning="direct")) == "direct"
+    assert _delta_reasoning(_Delta(model_extra={"reasoning": "extra"})) == "extra"
+    assert (
+        _delta_reasoning(
+            _Delta(model_extra={"reasoning_details": [{"text": "a"}, {"text": "b"}]})
+        )
+        == "ab"
+    )
+    assert _delta_reasoning(_Delta()) == ""
+
+
+def test_standalone_notebook_is_up_to_date():
+    """The molab file is generated; regenerating must be a no-op.
+
+    If this fails, run: uv run python build_standalone.py
+    """
+    import pathlib
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    import build_standalone
+
+    generated = build_standalone.build()
+    on_disk = build_standalone.OUTPUT_NOTEBOOK.read_text()
+    assert generated == on_disk, "box_prompt_standalone.py is stale — rebuild it"

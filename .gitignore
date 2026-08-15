@@ -15,3 +15,6 @@ data/raw/
 data/interim/
 __marimo__/
 .repo-bootstrap.tar.gz
+dist/
+dist_wasm/
+_to_delete/

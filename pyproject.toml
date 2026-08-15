@@ -29,6 +29,8 @@ packages = ["src/phd_boxprompt"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# generated file: duplicate imports inside one cell are legal and expected
+extend-exclude = ["notebooks/box_prompt_standalone.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -37,3 +39,7 @@ select = ["E", "F", "I", "UP", "B"]
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# marimo cells render by ending on a bare expression
+"notebooks/*.py" = ["B018"]

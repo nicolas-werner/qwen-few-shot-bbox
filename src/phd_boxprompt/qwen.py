@@ -9,6 +9,13 @@ Any vision model on OpenRouter works — set ``OPENROUTER_MODEL`` or pass
 
 ``qwen/qwen3.8-max``          proprietary hosted version (default)
 ``qwen/qwen3.8-2.4t-a95b``    the open-weight MoE release
+
+Two transports, picked automatically:
+
+* CPython — the ``openai`` SDK, with token-by-token streaming.
+* Pyodide (a WASM-exported notebook in the browser) — ``pyodide.http.pyfetch``,
+  since the SDK needs sockets the browser does not give us. Use the ``async``
+  twin :func:`adetect_similar` there. No streaming on that path.
 """
 
 from __future__ import annotations
@@ -18,6 +25,8 @@ import io
 import json
 import os
 import re
+import sys
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,10 +35,13 @@ from PIL import Image, ImageDraw
 __all__ = [
     "BoxPromptResult",
     "Detection",
+    "adetect_similar",
     "annotate_prompt_boxes",
     "detect_similar",
     "draw_detections",
     "parse_detections",
+    "resolve_api_key",
+    "running_in_browser",
 ]
 
 DEFAULT_MODEL = "qwen/qwen3.8-max"
@@ -39,6 +51,17 @@ POSITIVE_COLOR = "#16a34a"
 NEGATIVE_COLOR = "#dc2626"
 MATCH_COLOR = "#2563eb"
 
+MISSING_KEY_MESSAGE = (
+    "No OpenRouter API key. Paste one into the key field in the notebook, or set "
+    "OPENROUTER_API_KEY in the environment (or in a .env file). "
+    "Keys are free to create at https://openrouter.ai/keys"
+)
+
+
+def running_in_browser() -> bool:
+    """True when executing inside Pyodide, i.e. a WASM-exported notebook."""
+    return sys.platform == "emscripten"
+
 
 @dataclass(frozen=True)
 class Detection:
@@ -46,6 +69,20 @@ class Detection:
 
     box: tuple[int, int, int, int]
     label: str
+
+
+@dataclass(frozen=True)
+class BoxPromptResult:
+    """One box-prompt run: what came back, and how the model got there."""
+
+    detections: list[Detection]
+    answer: str
+    reasoning: str = ""
+    model: str = ""
+
+    def __iter__(self):
+        """Backwards-compatible ``detections, answer = detect_similar(...)``."""
+        return iter((self.detections, self.answer))
 
 
 # --------------------------------------------------------------------------- #
@@ -59,10 +96,7 @@ def _data_url(image: Image.Image) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def annotate_prompt_boxes(
-    image: Image.Image,
-    boxes: list[dict[str, Any]],
-) -> Image.Image:
+def annotate_prompt_boxes(image: Image.Image, boxes: list[dict[str, Any]]) -> Image.Image:
     """Return a copy of ``image`` with the exemplar boxes painted on it."""
     canvas = image.convert("RGB").copy()
     draw = ImageDraw.Draw(canvas)
@@ -162,36 +196,86 @@ def parse_detections(
     return detections
 
 
+def _reasoning_from_blocks(details: Any) -> str:
+    blocks: list[str] = []
+    for block in details or []:
+        if isinstance(block, dict):
+            text = block.get("text") or block.get("summary") or block.get("data")
+        else:
+            text = getattr(block, "text", None) or getattr(block, "summary", None)
+        if isinstance(text, str) and text.strip():
+            blocks.append(text.strip())
+    return "\n\n".join(blocks)
+
+
+def _extract_reasoning(message: Any) -> str:
+    """Pull the reasoning trace out of a message, dict or SDK object alike.
+
+    OpenRouter exposes it as ``reasoning`` (plain text) and/or
+    ``reasoning_details`` (a list of blocks). Neither is guaranteed — some
+    providers strip it, some models have none. Returns "" when absent.
+    """
+    if isinstance(message, Mapping):
+        text = message.get("reasoning")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return _reasoning_from_blocks(message.get("reasoning_details"))
+
+    text = getattr(message, "reasoning", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    details = getattr(message, "reasoning_details", None)
+    if not details:
+        # Non-standard fields survive on model_extra rather than as attributes.
+        extra = getattr(message, "model_extra", None) or {}
+        if isinstance(extra.get("reasoning"), str):
+            return str(extra["reasoning"]).strip()
+        details = extra.get("reasoning_details")
+    return _reasoning_from_blocks(details)
+
+
+def _delta_reasoning(delta: Any) -> str:
+    """Reasoning text carried by one streamed delta, if any."""
+    text = getattr(delta, "reasoning", None)
+    if isinstance(text, str):
+        return text
+    extra = getattr(delta, "model_extra", None) or {}
+    if isinstance(extra.get("reasoning"), str):
+        return str(extra["reasoning"])
+    blocks = extra.get("reasoning_details") or []
+    return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+
+
 # --------------------------------------------------------------------------- #
-# the API call
+# request construction
 # --------------------------------------------------------------------------- #
 
 
-def _client(timeout: float = 180.0):
-    from openai import OpenAI
-
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY is not set. Paste your key into .env "
-            "(copy .env.example if .env is missing), then restart the notebook."
-        )
-    return OpenAI(
-        api_key=api_key,
-        base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
-        timeout=timeout,
-        max_retries=2,
-    )
+def resolve_api_key(api_key: str | None = None) -> str:
+    """Explicit key wins, then the environment. Raises with a helpful message."""
+    key = (api_key or "").strip() or (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not key:
+        raise RuntimeError(MISSING_KEY_MESSAGE)
+    return key
 
 
-def _extra_headers() -> dict[str, str]:
-    """Optional OpenRouter attribution headers. Both are safe to leave unset."""
+def _attribution_headers() -> dict[str, str]:
+    """Optional OpenRouter attribution — cosmetic, only affects their rankings."""
     headers = {}
     if referer := os.getenv("OPENROUTER_SITE_URL"):
         headers["HTTP-Referer"] = referer
     if title := os.getenv("OPENROUTER_SITE_NAME"):
         headers["X-OpenRouter-Title"] = title
     return headers
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        **_attribution_headers(),
+    }
 
 
 PROMPT_TEMPLATE = """
@@ -213,51 +297,7 @@ For reference, the prompt boxes in normalized XYXY coordinates are: {box_summary
 """.strip()
 
 
-def _extract_reasoning(message: Any) -> str:
-    """Pull the reasoning trace out of an OpenRouter message, if the provider sent one.
-
-    OpenRouter exposes it as ``message.reasoning`` (plain text) and/or
-    ``message.reasoning_details`` (a list of blocks). Neither is guaranteed —
-    some providers strip it, some models have none. Returns "" when absent.
-    """
-    reasoning = getattr(message, "reasoning", None)
-    if isinstance(reasoning, str) and reasoning.strip():
-        return reasoning.strip()
-
-    details = getattr(message, "reasoning_details", None)
-    if not details:
-        # Non-standard fields survive on model_extra rather than as attributes.
-        extra = getattr(message, "model_extra", None) or {}
-        if isinstance(extra.get("reasoning"), str):
-            return str(extra["reasoning"]).strip()
-        details = extra.get("reasoning_details")
-
-    blocks: list[str] = []
-    for block in details or []:
-        if isinstance(block, dict):
-            text = block.get("text") or block.get("summary") or block.get("data")
-        else:
-            text = getattr(block, "text", None) or getattr(block, "summary", None)
-        if isinstance(text, str) and text.strip():
-            blocks.append(text.strip())
-    return "\n\n".join(blocks)
-
-
-@dataclass(frozen=True)
-class BoxPromptResult:
-    """One box-prompt run: what came back, and how the model got there."""
-
-    detections: list[Detection]
-    answer: str
-    reasoning: str = ""
-    model: str = ""
-
-    def __iter__(self):
-        """Backwards-compatible ``detections, answer = detect_similar(...)``."""
-        return iter((self.detections, self.answer))
-
-
-def detect_similar(
+def build_payload(
     image: Image.Image,
     boxes: list[dict[str, Any]],
     instruction: str = "",
@@ -266,17 +306,8 @@ def detect_similar(
     max_tokens: int = 8192,
     temperature: float = 0.0,
     reasoning: bool | str = True,
-) -> BoxPromptResult:
-    """Run one few-shot box prompt.
-
-    ``boxes`` is the widget's value: ``[{"box": [x1, y1, x2, y2], "kind": ...}]``
-    in original-image pixels. At least one positive box is required.
-
-    ``reasoning`` asks OpenRouter for the model's reasoning trace. Pass ``True``
-    to simply enable it, an effort level (``"low"``/``"medium"``/``"high"``) to
-    tune it, or ``False`` to skip. Providers that do not support it are handled
-    by retrying once without the parameter, so this never hard-fails a run.
-    """
+) -> dict[str, Any]:
+    """The JSON body for one box-prompt request. Shared by both transports."""
     if not any(b.get("kind") == "positive" for b in boxes):
         raise ValueError("draw at least one positive box before running detection")
 
@@ -288,53 +319,201 @@ def detect_similar(
         box_summary=normalized_box_summary(image, boxes),
     )
     annotated = annotate_prompt_boxes(image, boxes)
-    resolved_model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
 
-    request: dict[str, Any] = {
-        "model": resolved_model,
-        "extra_headers": _extra_headers(),
+    payload: dict[str, Any] = {
+        "model": model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL),
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": _data_url(annotated)},
-                    },
+                    {"type": "image_url", "image_url": {"url": _data_url(annotated)}},
                 ],
             }
         ],
         "max_tokens": int(max_tokens),
         "temperature": temperature,
     }
-
     if reasoning:
-        request["extra_body"] = {
-            "reasoning": (
-                {"effort": reasoning} if isinstance(reasoning, str) else {"enabled": True}
-            )
-        }
+        payload["reasoning"] = (
+            {"effort": reasoning} if isinstance(reasoning, str) else {"enabled": True}
+        )
+    return payload
 
-    client = _client()
-    try:
-        completion = client.chat.completions.create(**request)
-    except Exception:
-        if not reasoning:
-            raise
-        # The provider rejected the reasoning parameter — rerun plainly.
-        request.pop("extra_body", None)
-        completion = client.chat.completions.create(**request)
 
-    message = completion.choices[0].message
-    answer = str(message.content or "").strip()
+def _finish(payload: dict[str, Any], answer: str, reasoning: str, size) -> BoxPromptResult:
+    answer = answer.strip()
     if not answer:
         raise RuntimeError("the model returned no text; try raising max_tokens")
-
-    width, height = image.size
+    width, height = size
     return BoxPromptResult(
         detections=parse_detections(answer, width, height),
         answer=answer,
-        reasoning=_extract_reasoning(message),
-        model=resolved_model,
+        reasoning=reasoning.strip(),
+        model=str(payload.get("model", "")),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# transport: CPython, via the openai SDK
+# --------------------------------------------------------------------------- #
+
+
+def _consume_stream(
+    client: Any,
+    request: dict[str, Any],
+    on_chunk: Callable[[str, str], None],
+) -> tuple[str, str]:
+    """Stream a completion, reporting progress. Returns ``(answer, reasoning)``."""
+    answer_parts: list[str] = []
+    reasoning_parts: list[str] = []
+
+    stream: Iterator[Any] = client.chat.completions.create(**request, stream=True)
+    for chunk in stream:
+        # OpenRouter interleaves keep-alive and usage frames with no choices.
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        changed = False
+        if content := getattr(delta, "content", None):
+            answer_parts.append(str(content))
+            changed = True
+        if thought := _delta_reasoning(delta):
+            reasoning_parts.append(thought)
+            changed = True
+
+        if changed:
+            on_chunk("".join(reasoning_parts), "".join(answer_parts))
+
+    return "".join(answer_parts), "".join(reasoning_parts)
+
+
+def detect_similar(
+    image: Image.Image,
+    boxes: list[dict[str, Any]],
+    instruction: str = "",
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    max_tokens: int = 8192,
+    temperature: float = 0.0,
+    reasoning: bool | str = True,
+    on_chunk: Callable[[str, str], None] | None = None,
+) -> BoxPromptResult:
+    """Run one few-shot box prompt (CPython transport).
+
+    ``boxes`` is the widget's value: ``[{"box": [x1, y1, x2, y2], "kind": ...}]``
+    in original-image pixels. At least one positive box is required.
+
+    ``api_key`` overrides ``OPENROUTER_API_KEY``; either may supply the key.
+
+    ``reasoning`` asks OpenRouter for the model's reasoning trace. Pass ``True``
+    to enable it, an effort level (``"low"``/``"medium"``/``"high"``) to tune it,
+    or ``False`` to skip. Providers that do not support it are handled by
+    retrying once without the parameter, so this never hard-fails a run.
+
+    Pass ``on_chunk`` to stream. It is called with the accumulated
+    ``(reasoning, answer)`` after every delta.
+    """
+    from openai import OpenAI
+
+    payload = build_payload(
+        image,
+        boxes,
+        instruction,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        reasoning=reasoning,
+    )
+    client = OpenAI(
+        api_key=resolve_api_key(api_key),
+        base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
+        timeout=180.0,
+        max_retries=2,
+    )
+
+    request = {k: v for k, v in payload.items() if k != "reasoning"}
+    request["extra_headers"] = _attribution_headers()
+    if "reasoning" in payload:
+        request["extra_body"] = {"reasoning": payload["reasoning"]}
+
+    def call() -> tuple[str, str]:
+        if on_chunk is None:
+            completion = client.chat.completions.create(**request)
+            message = completion.choices[0].message
+            return str(message.content or ""), _extract_reasoning(message)
+        return _consume_stream(client, request, on_chunk)
+
+    try:
+        answer, trace = call()
+    except Exception:
+        if "extra_body" not in request:
+            raise
+        # The provider rejected the reasoning parameter — rerun plainly.
+        request.pop("extra_body", None)
+        answer, trace = call()
+
+    return _finish(payload, answer, trace, image.size)
+
+
+# --------------------------------------------------------------------------- #
+# transport: Pyodide, via the browser's fetch
+# --------------------------------------------------------------------------- #
+
+
+async def adetect_similar(
+    image: Image.Image,
+    boxes: list[dict[str, Any]],
+    instruction: str = "",
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    max_tokens: int = 8192,
+    temperature: float = 0.0,
+    reasoning: bool | str = True,
+) -> BoxPromptResult:
+    """Run one few-shot box prompt from a browser (Pyodide) notebook.
+
+    Uses ``pyodide.http.pyfetch`` because the ``openai`` SDK needs sockets that
+    WASM does not provide. OpenRouter serves permissive CORS headers, so the
+    request works directly from the page. No streaming on this path.
+    """
+    from pyodide.http import pyfetch  # noqa: PLC0415 — only exists in Pyodide
+
+    payload = build_payload(
+        image,
+        boxes,
+        instruction,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        reasoning=reasoning,
+    )
+    base = os.getenv("OPENROUTER_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+    response = await pyfetch(
+        f"{base}/chat/completions",
+        method="POST",
+        headers=_headers(resolve_api_key(api_key)),
+        body=json.dumps(payload),
+    )
+    if response.status != 200:
+        detail = (await response.string())[:400]
+        raise RuntimeError(f"OpenRouter returned HTTP {response.status}: {detail}")
+
+    data = await response.json()
+    if error := data.get("error"):
+        raise RuntimeError(f"OpenRouter error: {error}")
+
+    message = data["choices"][0]["message"]
+    return _finish(
+        payload,
+        str(message.get("content") or ""),
+        _extract_reasoning(message),
+        image.size,
     )
